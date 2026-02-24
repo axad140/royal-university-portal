@@ -15,8 +15,8 @@ import {
 // ═══════════════════════════════════════════════════════════════════
 //  SUPABASE CONFIG — unchanged from original
 // ═══════════════════════════════════════════════════════════════════
-const SUPABASE_URL = "https://your-project.supabase.co";
-const SUPABASE_ANON_KEY = "your-anon-key-here";
+const SUPABASE_URL = "https://uwdwuqvtrpsvpfjcqben.supabase.co";
+const SUPABASE_ANON_KEY = "sb_publishable_dPwyiUWp9Sc58mo1M-deAg_rI3pWVj1";
 const STORAGE_BUCKET = "admission-docs";
 
 // Admin credentials (in production, use server-side auth)
