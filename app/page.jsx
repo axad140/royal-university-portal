@@ -13,11 +13,14 @@ import {
 } from "lucide-react";
 
 // ═══════════════════════════════════════════════════════════════════
-//  SUPABASE CONFIG — unchanged from original
+//  SUPABASE CONFIG — reads from Vercel environment variables.
+//  In your Vercel project dashboard, set:
+//    NEXT_PUBLIC_SUPABASE_URL      → https://xxxx.supabase.co
+//    NEXT_PUBLIC_SUPABASE_ANON_KEY → your anon/public key
 // ═══════════════════════════════════════════════════════════════════
-const SUPABASE_URL = "https://uwdwuqvtrpsvpfjcqben.supabase.co";
-const SUPABASE_ANON_KEY = "sb_publishable_dPwyiUWp9Sc58mo1M-deAg_rI3pWVj1";
-const STORAGE_BUCKET = "admission-docs";
+const SUPABASE_URL      = process.env.NEXT_PUBLIC_SUPABASE_URL      || "";
+const SUPABASE_ANON_KEY = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || "";
+const STORAGE_BUCKET    = "admission-docs";
 
 // Admin credentials (in production, use server-side auth)
 const ADMIN_USERNAME = "uniadmin";
@@ -31,19 +34,41 @@ function generateAdmissionId() {
   return id + "-" + Date.now().toString().slice(-4);
 }
 
+// ─── uploadFile ─────────────────────────────────────────────────
+// Resilient: always returns a URL string on success, or null on ANY
+// failure (network error, 400, bucket missing, wrong mime, etc.).
+// The calling code must NEVER await this in a way that blocks the
+// DB insert — file upload failure must not prevent record creation.
 async function uploadFile(file, admissionId, fileType) {
-  if (!file) return null;
+  if (!file || !SUPABASE_URL || !SUPABASE_ANON_KEY) return null;
   try {
-    const ext = file.name.split(".").pop();
-    const path = `${admissionId}/${fileType}.${ext}`;
-    const res = await fetch(`${SUPABASE_URL}/storage/v1/object/${STORAGE_BUCKET}/${path}`, {
+    const rawExt = file.name.includes(".") ? file.name.split(".").pop().toLowerCase() : "bin";
+    const safeExt = rawExt.replace(/[^a-z0-9]/g, "");           // strip any odd chars
+    const safeName = `${fileType}.${safeExt}`;
+    const path = `${admissionId}/${safeName}`;
+    const uploadUrl = `${SUPABASE_URL}/storage/v1/object/${STORAGE_BUCKET}/${path}`;
+
+    const res = await fetch(uploadUrl, {
       method: "POST",
-      headers: { Authorization: `Bearer ${SUPABASE_ANON_KEY}`, "Content-Type": file.type },
+      headers: {
+        Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
+        "Content-Type": file.type || "application/octet-stream",
+        "x-upsert": "true",           // overwrite if re-uploaded, avoids 400 duplicate
+      },
       body: file,
     });
-    if (!res.ok) return null;
+
+    // Log non-OK responses for debugging but DO NOT throw
+    if (!res.ok) {
+      console.warn(`[uploadFile] ${fileType} upload returned ${res.status}. Record will still be saved.`);
+      return null;
+    }
+
     return `${SUPABASE_URL}/storage/v1/object/public/${STORAGE_BUCKET}/${path}`;
-  } catch (_) { return null; }
+  } catch (err) {
+    console.warn(`[uploadFile] ${fileType} upload failed with error:`, err, "— Record will still be saved.");
+    return null;
+  }
 }
 
 async function saveAdmission(data) {
@@ -419,8 +444,8 @@ function AdminDashboard({ onLogout, dark, setDark, C, isMobile }) {
                         <div style={{ fontSize:12, fontWeight:700, color:"#10B981" }}>PKR {Number(r.amount_paid).toLocaleString()}</div>
                       </div>
                     )}
-                    {r.payment_proof_url && (
-                      <a href={r.payment_proof_url} target="_blank" rel="noopener noreferrer" style={{ padding:"5px 12px", borderRadius:8, background:"rgba(37,99,235,.1)", border:"1px solid rgba(37,99,235,.2)", textDecoration:"none", display:"flex", alignItems:"center", gap:5, fontSize:12, fontWeight:700, color:"#2563EB" }}>
+                    {r.receipt_url && (
+                      <a href={r.receipt_url} target="_blank" rel="noopener noreferrer" style={{ padding:"5px 12px", borderRadius:8, background:"rgba(37,99,235,.1)", border:"1px solid rgba(37,99,235,.2)", textDecoration:"none", display:"flex", alignItems:"center", gap:5, fontSize:12, fontWeight:700, color:"#2563EB" }}>
                         <Upload size={11}/> Proof
                       </a>
                     )}
@@ -499,8 +524,8 @@ function AdminDashboard({ onLogout, dark, setDark, C, isMobile }) {
                           }
                         </td>
                         <td style={{ padding:"14px 16px" }}>
-                          {r.payment_proof_url
-                            ? <a href={r.payment_proof_url} target="_blank" rel="noopener noreferrer" style={{ fontSize:11, fontWeight:700, color:"#2563EB", textDecoration:"none", padding:"4px 10px", borderRadius:50, background:"rgba(37,99,235,.12)", display:"inline-flex", alignItems:"center", gap:4 }}>
+                          {r.receipt_url
+                            ? <a href={r.receipt_url} target="_blank" rel="noopener noreferrer" style={{ fontSize:11, fontWeight:700, color:"#2563EB", textDecoration:"none", padding:"4px 10px", borderRadius:50, background:"rgba(37,99,235,.12)", display:"inline-flex", alignItems:"center", gap:4 }}>
                                 <Upload size={10}/> View
                               </a>
                             : <span style={{ fontSize:11, color:C.muted, opacity:.5 }}>None</span>
@@ -723,39 +748,71 @@ export default function UniversityPortal() {
     setSubmitting(true);
     setSubmitError("");
     const admId = generateAdmissionId();
-    const [transcriptUrl, cnicUrl, photoUrl] = await Promise.all([
+
+    // ── Upload files in parallel.
+    // Promise.allSettled ensures ALL settle (fulfilled or rejected)
+    // before we continue — a failed upload never throws or blocks.
+    const [transcriptResult, cnicResult, photoResult] = await Promise.allSettled([
       uploadFile(files.transcript, admId, "transcript"),
       uploadFile(files.cnic,       admId, "cnic"),
       uploadFile(files.photo,      admId, "photo"),
     ]);
+
+    // Safely extract URL — null if upload failed for any reason
+    const transcriptUrl = transcriptResult.status === "fulfilled" ? transcriptResult.value : null;
+    const cnicUrl       = cnicResult.status       === "fulfilled" ? cnicResult.value       : null;
+    const photoUrl      = photoResult.status      === "fulfilled" ? photoResult.value      : null;
+
     const prog = PROGRAMS.find(p => p.id === form.program);
+
+    // ── Build DB payload using your exact column names
     const payload = {
-      admission_id: admId,
-      first_name: form.firstName, last_name: form.lastName,
-      father_name: form.fatherName, email: form.email,
-      phone: form.phone, dob: form.dob, gender: form.gender,
-      nationality: form.nationality, cnic: form.cnic, address: form.address,
-      program_id: form.program, program_title: prog ? prog.title : form.program,
-      ssc_marks:  form.sscMarks  ? Number(form.sscMarks)  : null,
-      ssc_total:  form.sscTotal  ? Number(form.sscTotal)  : null,
-      ssc_board:  form.sscBoard,
-      ssc_year:   form.sscYear   ? Number(form.sscYear)   : null,
-      hssc_marks: form.hsscMarks ? Number(form.hsscMarks) : null,
-      hssc_total: form.hsscTotal ? Number(form.hsscTotal) : null,
-      hssc_board: form.hsscBoard,
-      hssc_year:  form.hsscYear  ? Number(form.hsscYear)  : null,
-      prev_degree: form.prevDegree || null,
-      prev_cgpa: form.prevCgpa || null,
-      prev_institution: form.prevInstitution || null,
-      essay: form.essay,
-      transcript_url: transcriptUrl, cnic_url: cnicUrl, photo_url: photoUrl,
-      payment_status: "Pending", status: "Under Review",
-      submitted_at: new Date().toISOString(),
+      admission_id:      admId,
+      first_name:        form.firstName,
+      last_name:         form.lastName,
+      father_name:       form.fatherName,
+      email:             form.email,
+      phone:             form.phone,
+      dob:               form.dob,
+      gender:            form.gender,
+      nationality:       form.nationality,
+      cnic:              form.cnic,
+      address:           form.address,
+      program_id:        form.program,
+      program_title:     prog ? prog.title : form.program,
+      ssc_marks:         form.sscMarks  ? Number(form.sscMarks)  : null,
+      ssc_total:         form.sscTotal  ? Number(form.sscTotal)  : null,
+      ssc_board:         form.sscBoard  || null,
+      ssc_year:          form.sscYear   ? Number(form.sscYear)   : null,
+      hssc_marks:        form.hsscMarks ? Number(form.hsscMarks) : null,
+      hssc_total:        form.hsscTotal ? Number(form.hsscTotal) : null,
+      hssc_board:        form.hsscBoard || null,
+      hssc_year:         form.hsscYear  ? Number(form.hsscYear)  : null,
+      prev_degree:       form.prevDegree       || null,
+      prev_cgpa:         form.prevCgpa         || null,
+      prev_institution:  form.prevInstitution  || null,
+      essay:             form.essay,
+      // ── Exact column names from your Supabase schema ──
+      transcript_url:    transcriptUrl,   // null is fine — column is nullable
+      cnic_url:          cnicUrl,
+      photo_url:         photoUrl,
+      // receipt_url will be populated later via the Payment tab
+      receipt_url:       null,
+      payment_status:    "Pending",
+      status:            "Under Review",
+      submitted_at:      new Date().toISOString(),
     };
+
+    // ── DB insert always runs regardless of upload outcomes above
     const result = await saveAdmission(payload);
     setSubmitting(false);
-    if (result.success) { setGeneratedId(admId); setSubmitted(true); }
-    else setSubmitError("Submission failed. Check your Supabase credentials and try again.");
+
+    if (result.success) {
+      setGeneratedId(admId);
+      setSubmitted(true);
+    } else {
+      setSubmitError("Submission failed. Please check your Supabase credentials / RLS policies and try again.");
+    }
   };
 
   const handlePayment = async () => {
@@ -772,17 +829,20 @@ export default function UniversityPortal() {
     setPaymentLoading(true);
     setPaymentResult(null);
 
-    // Upload payment proof if provided
-    let proofUrl = null;
+    // Upload payment proof — failure returns null, does NOT block PATCH
+    let receiptUrl = null;
     if (paymentProofFile) {
-      proofUrl = await uploadFile(paymentProofFile, trimmed, "payment_proof");
+      const proofResult = await Promise.allSettled([
+        uploadFile(paymentProofFile, trimmed, "payment_proof"),
+      ]);
+      receiptUrl = proofResult[0].status === "fulfilled" ? proofResult[0].value : null;
     }
 
     const extra = {
-      payment_type:       paymentType,
-      transaction_id:     transactionId.trim(),
-      amount_paid:        parseFloat(amountPaid),
-      payment_proof_url:  proofUrl,
+      payment_type:    paymentType,
+      transaction_id:  transactionId.trim(),
+      amount_paid:     parseFloat(amountPaid),
+      receipt_url:     receiptUrl,          // correct column name
     };
 
     const result = await updatePaymentStatus(trimmed, extra);
@@ -1185,7 +1245,7 @@ export default function UniversityPortal() {
                             ["Method",    paymentResult.data.payment_type || paymentType],
                             ["TXN Ref",   paymentResult.data.transaction_id || transactionId],
                             ["Amount",    paymentResult.data.amount_paid ? `PKR ${Number(paymentResult.data.amount_paid).toLocaleString()}` : `PKR ${Number(amountPaid).toLocaleString()}`],
-                            ["Proof",     paymentResult.data.payment_proof_url ? "Uploaded ✓" : paymentProofFile ? "Uploaded ✓" : "Not uploaded"],
+                            ["Proof",     paymentResult.data.receipt_url ? "Uploaded ✓" : paymentProofFile ? "Uploaded ✓" : "Not uploaded"],
                             ["Status",    "Paid ✓"],
                             ["Paid At",   paymentResult.data.paid_at ? new Date(paymentResult.data.paid_at).toLocaleString() : "—"],
                           ].map(([k,v])=>(
